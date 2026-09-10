@@ -1,0 +1,27 @@
+# STEP 1 — paste this under the SERVING container's `spec:` in your existing
+# deployment.yaml (the one from d2-self-healing), so it sits alongside
+# image/command/ports for that container — NOT at the pod or deployment level.
+#
+# Before:
+#   containers:
+#     - name: serving
+#       image: lamaalfarraj/aidc-serving:cpu-v1
+#       ports: [...]
+#
+# After:
+#   containers:
+#     - name: serving
+#       image: lamaalfarraj/aidc-serving:cpu-v1
+#       ports: [...]
+#       resources:
+#         requests:
+#           cpu: 250m          # what the scheduler reserves
+#           memory: 256Mi
+#         limits:
+#           cpu: "1"           # what the runtime enforces
+#           memory: 512Mi
+#
+# Then:
+#   kubectl apply -f ../d2-self-healing/deployment.yaml
+#   kubectl rollout status deployment/serving
+#   kubectl describe node | grep -A8 'Allocated resources'
