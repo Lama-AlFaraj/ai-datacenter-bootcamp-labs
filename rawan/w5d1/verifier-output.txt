@@ -1,0 +1,2 @@
+Checked 2 indicators, 5 data panels and 5 queries.
+GREEN CHECK: PASS

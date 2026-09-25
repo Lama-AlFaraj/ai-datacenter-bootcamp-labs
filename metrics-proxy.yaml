@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-proxy-code
+data:
+  proxy.py: |
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import urllib.request, urllib.error, time, threading
+
+    BACKEND = "http://team-serving:8000"
+    BUCKETS = [0.1, 0.25, 0.5, 1, 2, 5]
+    lock = threading.Lock()
+    counts = {}
+    hist = {}
+
+    def record(method, path, status, duration):
+        with lock:
+            key = (method, path, str(status))
+            counts[key] = counts.get(key, 0) + 1
+            h = hist.setdefault(path, {'buckets': [0]*len(BUCKETS), 'sum': 0.0, 'count': 0})
+            for i, b in enumerate(BUCKETS):
+                if duration <= b:
+                    h['buckets'][i] += 1
+            h['sum'] += duration
+            h['count'] += 1
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def _proxy(self):
+            if self.path == '/metrics':
+                self._metrics(); return
+            if self.path == '/health':
+                self.send_response(200); self.end_headers(); self.wfile.write(b'ok'); return
+            length = int(self.headers.get('Content-Length', 0) or 0)
+            body = self.rfile.read(length) if length else None
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'content-length')}
+            req = urllib.request.Request(BACKEND + self.path, data=body, method=self.command, headers=headers)
+            start = time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = resp.read(); status = resp.status
+            except urllib.error.HTTPError as e:
+                data = e.read(); status = e.code
+            except (urllib.error.URLError, TimeoutError):
+                data = b'{"error":"upstream unreachable"}'; status = 502
+            duration = time.monotonic() - start
+            record(self.command, self.path, status, duration)
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self): self._proxy()
+        def do_POST(self): self._proxy()
+
+        def _metrics(self):
+            lines = ['# HELP app_http_requests_total Total HTTP requests proxied to the backend',
+                     '# TYPE app_http_requests_total counter']
+            with lock:
+                for (method, path, status), c in counts.items():
+                    lines.append(f'app_http_requests_total{{method="{method}",path="{path}",status="{status}"}} {c}')
+                lines.append('# HELP app_http_request_duration_seconds Request duration proxied to backend')
+                lines.append('# TYPE app_http_request_duration_seconds histogram')
+                for path, h in hist.items():
+                    cumulative = 0
+                    for i, b in enumerate(BUCKETS):
+                        cumulative += h['buckets'][i]
+                        lines.append(f'app_http_request_duration_seconds_bucket{{path="{path}",le="{b}"}} {cumulative}')
+                    lines.append(f'app_http_request_duration_seconds_bucket{{path="{path}",le="+Inf"}} {h["count"]}')
+                    lines.append(f'app_http_request_duration_seconds_sum{{path="{path}"}} {h["sum"]}')
+                    lines.append(f'app_http_request_duration_seconds_count{{path="{path}"}} {h["count"]}')
+            raw = ('\n'.join(lines) + '\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; version=0.0.4')
+            self.end_headers()
+            self.wfile.write(raw)
+
+    ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: metrics-proxy}
+  template:
+    metadata:
+      labels: {app: metrics-proxy}
+    spec:
+      containers:
+        - name: proxy
+          image: python:3.12-alpine
+          command: [python3, -u, /app/proxy.py]
+          ports: [{containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - {name: code, mountPath: /app, readOnly: true}
+      volumes:
+        - name: code
+          configMap: {name: metrics-proxy-code}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-proxy
+spec:
+  type: NodePort
+  selector: {app: metrics-proxy}
+  ports:
+    - {port: 8080, targetPort: 8080, nodePort: 30801}
